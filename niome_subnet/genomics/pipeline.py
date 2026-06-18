@@ -117,7 +117,7 @@ def filter_and_normalize(vcf: str, ref_fasta: str, work_dir: str) -> str:
     filtered = os.path.join(work_dir, "filtered.vcf.gz")
     if MIN_QUAL > 0:
         _run(
-            f"bcftools view -e 'QUAL<{MIN_QUAL} || FILTER!~\"PASS\"' {vcf} -Oz -o {filtered}",
+            f"bcftools view -e 'QUAL<{MIN_QUAL}' -f 'PASS,.' {vcf} -Oz -o {filtered}",
             shell=True,
         )
         _run(["bcftools", "index", "-f", filtered])
