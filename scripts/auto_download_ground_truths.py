@@ -33,6 +33,8 @@ except ImportError:
 
 DEFAULT_DASHBOARD = "https://niome-leaderboard.genomes.io"
 DEFAULT_API = "https://niome-api.genomes.io"
+GROUND_TRUTH_URLS_ENDPOINT = f"{DEFAULT_API}/api/tasks/ground_truth_urls"
+TASKS_LIST_ENDPOINT = f"{DEFAULT_API}/api/tasks"
 DOWNLOAD_DIR = Path("/tmp/auto_gt")
 TRAINING_INDEX = Path.home() / "niome_training" / "ground_truths" / "index.json"
 COLLECTOR = Path(__file__).parent / "collect_ground_truth.py"
@@ -157,6 +159,91 @@ def discover_api_urls():
     for u in sorted(interesting):
         print(f"  {u}")
     return list(interesting)
+
+
+def fetch_ground_truth_urls():
+    """Hit the dashboard's /api/tasks/ground_truth_urls endpoint.
+
+    Returns a dict mapping task_id -> download URL, or None on failure.
+    Tries both GET and POST since we don't know the protocol yet.
+    """
+    print(f"Calling {GROUND_TRUTH_URLS_ENDPOINT} ...")
+
+    # Try GET first
+    for method in ("GET", "POST"):
+        try:
+            if method == "GET":
+                r = requests.get(GROUND_TRUTH_URLS_ENDPOINT, timeout=30)
+            else:
+                r = requests.post(GROUND_TRUTH_URLS_ENDPOINT, json={}, timeout=30)
+            print(f"  {method} → {r.status_code} ({len(r.content)} bytes)")
+            ct = r.headers.get("content-type", "")
+            if r.status_code == 200 and "json" in ct:
+                data = r.json()
+                # Normalize: data could be {task_id: url}, list of {id, url}, or other
+                mapping = {}
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if UUID_RE.match(k) and isinstance(v, str) and v.startswith("http"):
+                            mapping[k] = v
+                    # Or it could be wrapped: {"data": {...}, "urls": {...}}
+                    for wrapper in ("data", "urls", "ground_truth_urls", "tasks"):
+                        if wrapper in data:
+                            inner = data[wrapper]
+                            if isinstance(inner, dict):
+                                for k, v in inner.items():
+                                    if UUID_RE.match(k) and isinstance(v, str) and v.startswith("http"):
+                                        mapping[k] = v
+                            elif isinstance(inner, list):
+                                for item in inner:
+                                    if isinstance(item, dict):
+                                        tid = item.get("task_id") or item.get("id")
+                                        url = item.get("url") or item.get("ground_truth_url") or item.get("download_url")
+                                        if tid and url:
+                                            mapping[tid] = url
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            tid = item.get("task_id") or item.get("id")
+                            url = item.get("url") or item.get("ground_truth_url") or item.get("download_url")
+                            if tid and url:
+                                mapping[tid] = url
+                if mapping:
+                    print(f"  ✓ Found {len(mapping)} task→URL mappings")
+                    return mapping
+                # No mappings recognized — dump first 500 chars to help debug
+                print(f"  ? Response shape not recognized. First 500 chars:")
+                print(f"    {r.text[:500]}")
+                return None
+        except Exception as e:
+            print(f"  {method} failed: {type(e).__name__}: {e}")
+    return None
+
+
+def download_ground_truth_from_url(url, task_id, download_dir):
+    """Download from the URL returned by the API. Returns (path, info_str) or (None, err)."""
+    try:
+        r = requests.get(url, timeout=120, stream=True)
+        if r.status_code != 200:
+            return None, f"http {r.status_code}"
+        # Determine extension from Content-Disposition or URL
+        cd = r.headers.get("content-disposition", "")
+        fname_m = re.search(r'filename="?([^";]+)"?', cd)
+        suffix = ".zip"
+        if fname_m:
+            suffix = Path(fname_m.group(1)).suffix or ".zip"
+        elif "." in url.split("?")[0].rsplit("/", 1)[-1]:
+            suffix = "." + url.split("?")[0].rsplit(".", 1)[-1]
+        target = download_dir / f"{task_id}{suffix}"
+        total = 0
+        with open(target, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
+        return target, f"{total // 1024} KB"
+    except requests.RequestException as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def probe_endpoint(task_id):
@@ -334,33 +421,59 @@ def main():
         print(f"Imported: {imported}")
         return
 
-    # ---- API mode (default) ----
+    # ---- API mode (default): use discovered /api/tasks/ground_truth_urls endpoint ----
 
-    # Collect task IDs
+    print("Fetching ground truth URLs from API...")
+    url_map = fetch_ground_truth_urls()
+    if not url_map:
+        print("✗ Could not fetch ground truth URLs.")
+        print("  Try --probe (legacy pattern probing) or --browser (Playwright fallback).")
+        return
+
+    # Filter to tasks we don't have yet
     if args.task_ids:
         with open(args.task_ids) as f:
-            task_ids = [line.strip() for line in f if line.strip()]
-        print(f"Read {len(task_ids)} task IDs from {args.task_ids}")
-    else:
-        print("Discovering task IDs from dashboard...")
-        task_ids = fetch_task_ids_from_dashboard()
-        print(f"Found {len(task_ids)} task ID(s)")
-        if not task_ids:
-            print("No task IDs found. Try --task-ids or --browser modes.")
-            return
+            wanted = set(line.strip() for line in f if line.strip())
+        url_map = {k: v for k, v in url_map.items() if k in wanted}
+        print(f"Filtered to {len(url_map)} task(s) from {args.task_ids}")
 
-    new_tasks = [tid for tid in task_ids if tid not in existing]
-    print(f"  {len(new_tasks)} new (not yet imported)")
+    new_url_map = {k: v for k, v in url_map.items() if k not in existing}
+    print(f"  {len(new_url_map)} new (not yet imported)")
+
+    new_items = list(new_url_map.items())
     if args.max:
-        new_tasks = new_tasks[:args.max]
-        print(f"  limited to {len(new_tasks)} by --max")
+        new_items = new_items[: args.max]
+        print(f"  limited to {len(new_items)} by --max")
 
-    if not new_tasks:
+    if not new_items:
         print("Nothing to download. All known tasks already imported.")
         return
 
-    # Probe to find the working endpoint using the first task
-    probe_id = new_tasks[0]
+    downloaded = 0
+    imported = 0
+    for i, (task_id, url) in enumerate(new_items, 1):
+        print(f"\n[{i}/{len(new_items)}] {task_id}")
+        print(f"  URL: {url}")
+        path, info = download_ground_truth_from_url(url, task_id, DOWNLOAD_DIR)
+        if path:
+            print(f"  ✓ saved {path.name} ({info})")
+            downloaded += 1
+            if import_download(path, task_id):
+                imported += 1
+                print(f"  ✓ imported into corpus")
+                if not args.keep:
+                    path.unlink(missing_ok=True)
+        else:
+            print(f"  ✗ failed: {info}")
+        time.sleep(0.5)
+
+    print(f"\n=== Summary ===")
+    print(f"Downloaded: {downloaded}")
+    print(f"Imported: {imported}")
+    return
+
+    # Legacy probe-based code (unreachable, kept for reference)
+    probe_id = next(iter(existing), None) or "d4517212-279f-413b-a2ed-1896d5f4fdd6"
     endpoint = probe_endpoint(probe_id)
     if not endpoint:
         print("\n✗ Could not auto-discover an API endpoint.")
