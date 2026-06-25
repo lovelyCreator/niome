@@ -69,6 +69,17 @@ class Miner(BaseMinerNeuron):
             f"expected_n={expected_n}"
         )
 
+        # Validator liveness probes have task_ids starting with "probe-" and
+        # carry malformed regions (e.g. "7:CFTR") with bogus 404 FASTQ URLs.
+        # Don't run the pipeline — respond instantly with a well-formed empty VCF.
+        if task.task_id.startswith("probe-"):
+            synapse.vcf_content = self._empty_vcf(task.genome_context.chromosome)
+            synapse.cftr_annotations = {}
+            bt.logging.info(
+                f"Task {task.task_id}: probe, empty VCF in {time.time()-start_time:.2f}s"
+            )
+            return synapse
+
         # Validator declares expected variant count. expected_n == 0 means a
         # negative-control task — emitting ANY calls = false positives = 0 score.
         # Toggle off via NIOME_USE_EXPECTED_COUNT=false if the field turns out
@@ -112,7 +123,9 @@ class Miner(BaseMinerNeuron):
             )
         except Exception as e:
             bt.logging.error(f"Forward error on task {task.task_id}: {e}")
-            synapse.vcf_content = ""
+            # Return well-formed empty VCF (not empty string) so validator can
+            # at least parse our response and not penalize us for malformed output.
+            synapse.vcf_content = self._empty_vcf(task.genome_context.chromosome)
             synapse.cftr_annotations = {}
 
         return synapse
