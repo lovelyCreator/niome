@@ -69,10 +69,20 @@ def log(msg):
 
 
 def load_imported_task_ids():
+    """Return all task_ids known to be duplicates of something we already have.
+
+    This includes the canonical task_id of each unique simulation AND every
+    alias recorded after dedup — otherwise we'd re-download known duplicates
+    every cycle just to throw them away.
+    """
     if not INDEX_FILE.exists():
         return set()
     with open(INDEX_FILE) as f:
-        return set(json.load(f).get("tasks", {}).keys())
+        idx = json.load(f)
+    known = set(idx.get("tasks", {}).keys())
+    for task in idx.get("tasks", {}).values():
+        known.update(task.get("aliases", []))
+    return known
 
 
 def load_state():
