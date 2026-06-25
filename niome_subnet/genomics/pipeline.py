@@ -46,6 +46,10 @@ DEEPVARIANT_IMAGE = os.environ.get(
     "NIOME_DEEPVARIANT_IMAGE", "google/deepvariant:1.8.0-gpu"
 )
 DV_MODEL = os.environ.get("NIOME_DV_MODEL", "WGS")
+# GPU device selector for DeepVariant. Default: "device=1" so we don't fight
+# with whatever else is using GPU 0 (e.g. a separate subnet 32 miner).
+# Set to "all" if you only have one GPU OR want to use both.
+DV_GPU_DEVICE = os.environ.get("NIOME_DV_GPU_DEVICE", "device=1")
 CLAIR3_MODEL_PATH = os.environ.get("NIOME_CLAIR3_MODEL_PATH")
 CLAIR3_PLATFORM = os.environ.get("NIOME_CLAIR3_PLATFORM", "ilmn")
 MIN_QUAL = float(os.environ.get("NIOME_MIN_QUAL", "20"))
@@ -375,7 +379,7 @@ def _call_deepvariant(ref_fasta: str, bam: str, region: str, work_dir: str) -> s
     shards = max(1, os.cpu_count() or 4)
     cmd = ["docker", "run", "--rm"]
     if USE_GPU:
-        cmd += ["--gpus", "all"]
+        cmd += ["--gpus", DV_GPU_DEVICE]
     cmd += [
         "-v", f"{ref_dir}:/ref",
         "-v", f"{bam_dir}:/bam",
