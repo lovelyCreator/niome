@@ -191,18 +191,40 @@ def inspect_api_calls():
 
     print(f"  inspecting {len(contents)} JS sources for API call context\n")
 
-    # Search for key API paths and show 200 chars of surrounding context
-    keywords = ["ground_truth_urls", "ground_truth", "api/tasks", "api/leaderboard",
-                "api/miner_scores", "api/niome_snapshot"]
+    # Search for key API paths and show LARGER surrounding context
+    # to reveal helper functions, state-setting calls, etc.
+    keywords = ["ground_truth_urls", "ground_truth_file"]
     for src, txt in contents:
         for kw in keywords:
             for m in re.finditer(re.escape(kw), txt):
-                start = max(0, m.start() - 150)
-                end = min(len(txt), m.end() + 250)
+                start = max(0, m.start() - 600)
+                end = min(len(txt), m.end() + 800)
                 snippet = txt[start:end].replace("\n", "\\n")
-                print(f"--- {kw} in {src.split('/')[-1][:40]} ---")
+                print(f"--- {kw} in {src.split('/')[-1][:40]} (offset {m.start()}) ---")
                 print(f"    ...{snippet}...")
                 print()
+
+    # Also look for the yb constant (the file-type list) and any selectedTask/currentTask state
+    print("\n=== Looking for `yb` constant (file type definitions) ===")
+    for src, txt in contents:
+        # Find variable definitions like `yb=[{...}]` or `const yb=[...]`
+        for m in re.finditer(r'\b(yb|yc|ya|yd|ye)\s*=\s*\[\s*\{[^}]*key', txt):
+            start = max(0, m.start() - 50)
+            end = min(len(txt), m.end() + 600)
+            snippet = txt[start:end].replace("\n", "\\n")
+            print(f"--- {m.group(1)} definition ---")
+            print(f"    ...{snippet}...")
+            print()
+
+    print("\n=== Looking for task selection / state setters ===")
+    for src, txt in contents:
+        for kw in ("setSelectedTask", "currentTask", "selectedTask", "taskId"):
+            for m in list(re.finditer(re.escape(kw), txt))[:3]:  # only first 3
+                start = max(0, m.start() - 100)
+                end = min(len(txt), m.end() + 200)
+                snippet = txt[start:end].replace("\n", "\\n")
+                print(f"--- {kw} ---")
+                print(f"    ...{snippet}...")
 
 
 def fetch_ground_truth_urls(task_id=None):
