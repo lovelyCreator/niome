@@ -7,7 +7,7 @@ RTX 5090 + small CFTR region (~190kb).
 Prerequisites on the miner host (Ubuntu 22.04):
   - bwa-mem2, samtools, bcftools, tabix, bgzip on PATH
   - One of:
-      (a) Docker + GPU runtime + `google/deepvariant:1.6.1-gpu` pulled (default)
+      (a) Docker + GPU runtime + `google/deepvariant:1.8.0-gpu` pulled (default)
       (b) Clair3 native install (faster startup): `conda install -c bioconda clair3`
           plus a Clair3 model (e.g. ilmn pre-trained from
           https://github.com/HKU-BAL/Clair3#pre-trained-models)
@@ -16,7 +16,7 @@ Prerequisites on the miner host (Ubuntu 22.04):
 Environment variables:
   NIOME_REF_FASTA          required, absolute path to GRCh38 FASTA
   NIOME_CALLER             "deepvariant" (default) | "clair3" | "bcftools"
-  NIOME_DEEPVARIANT_IMAGE  default: google/deepvariant:1.6.1-gpu
+  NIOME_DEEPVARIANT_IMAGE  default: google/deepvariant:1.8.0-gpu
   NIOME_DV_MODEL           default: WGS  (WGS | WES | PACBIO | ONT_R104)
   NIOME_CLAIR3_MODEL_PATH  required if NIOME_CALLER=clair3
   NIOME_CLAIR3_PLATFORM    default: ilmn
@@ -37,9 +37,10 @@ import bittensor as bt
 
 
 CALLER = os.environ.get("NIOME_CALLER", "deepvariant").lower()
+DBSNP_VCF = os.environ.get("NIOME_DBSNP_VCF")
 REF_FASTA = os.environ.get("NIOME_REF_FASTA")
 DEEPVARIANT_IMAGE = os.environ.get(
-    "NIOME_DEEPVARIANT_IMAGE", "google/deepvariant:1.6.1-gpu"
+    "NIOME_DEEPVARIANT_IMAGE", "google/deepvariant:1.8.0-gpu"
 )
 DV_MODEL = os.environ.get("NIOME_DV_MODEL", "WGS")
 CLAIR3_MODEL_PATH = os.environ.get("NIOME_CLAIR3_MODEL_PATH")
@@ -105,7 +106,55 @@ def call_variants(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
         return _call_clair3(ref_fasta, bam, region, work_dir)
     if CALLER == "bcftools":
         return _call_bcftools(ref_fasta, bam, region, work_dir)
+    if CALLER == "dual":
+        return _call_dual(ref_fasta, bam, region, work_dir)
     raise PipelineError(f"Unknown NIOME_CALLER={CALLER!r}")
+
+
+def _call_bcftools_supplementary(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
+    """bcftools call for indel sensitivity. Saves to separate filename to avoid conflict."""
+    out_vcf = os.path.join(work_dir, "bcftools_calls.vcf.gz")
+    cmd = (
+        f"bcftools mpileup -f {ref_fasta} -r {region} --max-depth 1000 --min-BQ 5 --min-MQ 5 -a AD,DP,SP {bam} "
+        f"| bcftools call -mv --prior 0.001 -Oz -o {out_vcf}"
+    )
+    _run(cmd, shell=True)
+    _run(["bcftools", "index", "-f", out_vcf])
+    return out_vcf
+
+
+def _call_dual(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
+    """Run DeepVariant + bcftools, merge calls."""
+    dv_vcf = _call_deepvariant(ref_fasta, bam, region, work_dir)
+    bcf_vcf = _call_bcftools_supplementary(ref_fasta, bam, region, work_dir)
+    merged = os.path.join(work_dir, "merged_calls.vcf.gz")
+    _run(
+        f"bcftools concat -a {dv_vcf} {bcf_vcf} 2>/dev/null "
+        f"| bcftools sort 2>/dev/null "
+        f"| bcftools norm -d all -f {ref_fasta} -Oz -o {merged}",
+        shell=True
+    )
+    _run(["bcftools", "index", "-f", merged])
+    return merged
+
+
+def annotate_with_dbsnp(vcf: str, work_dir: str) -> str:
+    """Annotate VCF ID column with ClinVar IDs, then filter to ClinVar-annotated only."""
+    if not DBSNP_VCF or not os.path.exists(DBSNP_VCF):
+        return vcf
+    annotated = os.path.join(work_dir, "rsid_annotated.vcf.gz")
+    _run([
+        "bcftools", "annotate",
+        "-a", DBSNP_VCF,
+        "-c", "ID",
+        vcf, "-Oz", "-o", annotated,
+    ])
+    _run(["bcftools", "index", "-f", annotated])
+    # Drop variants without ClinVar IDs - eliminates most FPs
+    out = os.path.join(work_dir, "clinvar_only.vcf.gz")
+    _run(f"bcftools view -e 'ID=\".\"' {annotated} -Oz -o {out}", shell=True)
+    _run(["bcftools", "index", "-f", out])
+    return out
 
 
 def filter_and_normalize(vcf: str, ref_fasta: str, work_dir: str) -> str:
@@ -177,6 +226,10 @@ def run_pipeline(
         timings["call"] = time.time() - t0
 
         t0 = time.time()
+        raw_vcf = annotate_with_dbsnp(raw_vcf, work_dir)
+        timings["annotate"] = time.time() - t0
+
+        t0 = time.time()
         norm_vcf = filter_and_normalize(raw_vcf, ref_fasta, work_dir)
         text = vcf_to_text(norm_vcf)
         timings["normalize"] = time.time() - t0
@@ -219,6 +272,9 @@ def _call_deepvariant(ref_fasta: str, bam: str, region: str, work_dir: str) -> s
 
 
 def _call_clair3(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
+    clair3_bin = "/home/po/miniconda3/envs/clair3/bin"
+    if clair3_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = clair3_bin + ":" + os.environ.get("PATH", "")
     if not CLAIR3_MODEL_PATH:
         raise PipelineError("NIOME_CLAIR3_MODEL_PATH not set")
     out_dir = os.path.join(work_dir, "clair3_out")
@@ -227,7 +283,7 @@ def _call_clair3(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
     start, _, end = span.partition("-")
     threads = max(1, os.cpu_count() or 4)
     cmd = [
-        "run_clair3.sh",
+        "/home/po/miniconda3/envs/clair3/bin/run_clair3.sh",
         f"--bam_fn={bam}",
         f"--ref_fn={ref_fasta}",
         f"--threads={threads}",
@@ -235,10 +291,17 @@ def _call_clair3(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
         f"--model_path={CLAIR3_MODEL_PATH}",
         f"--output={out_dir}",
         f"--ctg_name={chrom}",
-        "--include_all_ctgs",
     ]
     if start and end:
-        cmd += [f"--ctg_start={start}", f"--ctg_end={end}"]
+        bed_path = os.path.join(work_dir, "region.bed")
+        with open(bed_path, "w") as bf:
+            bf.write(f"{chrom}\t{start}\t{end}\n")
+        cmd.append(f"--bed_fn={bed_path}")
+    cmd.extend([
+        "--pypy=/home/po/miniconda3/envs/clair3/bin/pypy3",
+        "--python=/home/po/miniconda3/envs/clair3/bin/python",
+        "--samtools=/home/po/miniconda3/envs/clair3/bin/samtools",
+    ])
     _run(cmd)
     merged = os.path.join(out_dir, "merge_output.vcf.gz")
     if not os.path.exists(merged):
@@ -249,8 +312,8 @@ def _call_clair3(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
 def _call_bcftools(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
     out_vcf = os.path.join(work_dir, "calls.vcf.gz")
     cmd = (
-        f"bcftools mpileup -f {ref_fasta} -r {region} {bam} "
-        f"| bcftools call -mv -Oz -o {out_vcf}"
+        f"bcftools mpileup -f {ref_fasta} -r {region} --max-depth 1000 --min-BQ 5 --min-MQ 5 -a AD,DP,SP {bam} "
+        f"| bcftools call -mv --prior 0.001 -Oz -o {out_vcf}"
     )
     _run(cmd, shell=True)
     _run(["bcftools", "index", "-f", out_vcf])
