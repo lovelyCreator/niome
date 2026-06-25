@@ -13,6 +13,7 @@ The script:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -28,15 +29,26 @@ INDEX_FILE = GT_DIR / "index.json"
 
 def load_index():
     if not INDEX_FILE.exists():
-        return {"tasks": {}}
+        return {"tasks": {}, "by_truth_hash": {}}
     with open(INDEX_FILE) as f:
-        return json.load(f)
+        idx = json.load(f)
+    idx.setdefault("by_truth_hash", {})
+    return idx
 
 
 def save_index(index):
     GT_DIR.mkdir(parents=True, exist_ok=True)
     with open(INDEX_FILE, "w") as f:
         json.dump(index, f, indent=2, sort_keys=True)
+
+
+def file_hash(path):
+    """SHA1 of a file's contents — short enough for dedup key, no collisions in practice."""
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 
 
 def find_required_files(source_dir):
@@ -139,10 +151,36 @@ def main():
         sys.exit(f"Source missing required files ({err}). Expected: {REQUIRED_FILES}")
 
     task_id = args.task_id or src.stem
+
+    # Deduplicate by truth hash. Validator recycles the same simulation across
+    # many task_ids; only the truth file content is what matters for training.
+    truth_hash = file_hash(found["truth.vcf"])
+
+    index = load_index()
+
+    if truth_hash in index["by_truth_hash"]:
+        # Duplicate simulation — record the new task_id alias but don't re-copy files
+        existing_task_id = index["by_truth_hash"][truth_hash]
+        index["tasks"].setdefault(existing_task_id, {}).setdefault("aliases", [])
+        if task_id not in index["tasks"][existing_task_id]["aliases"]:
+            index["tasks"][existing_task_id]["aliases"].append(task_id)
+        save_index(index)
+        print(f"DUPLICATE: truth_hash={truth_hash} already exists at task {existing_task_id}")
+        print(f"  Recorded {task_id} as alias. Skipping file copy.")
+        # Clean up the temp dir to save space
+        if args.move:
+            try:
+                shutil.rmtree(source_dir)
+            except Exception:
+                pass
+        print(f"Unique simulations: {len(index['by_truth_hash'])} | Total tasks seen: "
+              f"{sum(1 + len(t.get('aliases', [])) for t in index['tasks'].values())}")
+        return
+
+    # New unique simulation — store it
     target_dir = GT_DIR / task_id
     if target_dir.exists():
         print(f"Warning: {target_dir} already exists, will overwrite")
-
     target_dir.mkdir(parents=True, exist_ok=True)
 
     op = shutil.move if args.move else shutil.copy2
@@ -151,14 +189,16 @@ def main():
 
     stats = analyze_ground_truth(target_dir)
     stats["task_id"] = task_id
+    stats["truth_hash"] = truth_hash
+    stats["aliases"] = []
 
-    index = load_index()
     index["tasks"][task_id] = stats
+    index["by_truth_hash"][truth_hash] = task_id
     save_index(index)
 
-    print(f"Collected: {target_dir}")
+    print(f"NEW UNIQUE: {target_dir} (truth_hash={truth_hash})")
     print(f"Stats: {json.dumps(stats, indent=2)}")
-    print(f"Total tasks collected: {len(index['tasks'])}")
+    print(f"Unique simulations: {len(index['by_truth_hash'])}")
 
 
 if __name__ == "__main__":
