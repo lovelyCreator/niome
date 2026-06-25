@@ -106,6 +106,59 @@ def fetch_task_ids_from_dashboard():
     return list(found)
 
 
+def discover_api_urls():
+    """Parse the dashboard's HTML + JS bundles for API URL patterns.
+
+    Most SPAs hard-code their API base URL in their JS bundle. This finds it.
+    Returns a list of candidate URLs/patterns found.
+    """
+    print("Fetching dashboard HTML...")
+    try:
+        r = requests.get(DEFAULT_DASHBOARD, timeout=30)
+        html = r.text
+        print(f"  Got {len(html)} bytes")
+    except Exception as e:
+        print(f"  ✗ failed to fetch dashboard: {e}")
+        return []
+
+    # Find all script src URLs
+    scripts = re.findall(r'<script[^>]*src=["\']([^"\']+)["\']', html)
+    # Also look at inline scripts
+    inline = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+    print(f"  Found {len(scripts)} script tags, {len(inline)} inline scripts")
+
+    # Gather text content
+    contents = list(inline)
+    for s in scripts:
+        if not s.startswith("http"):
+            s = DEFAULT_DASHBOARD + (s if s.startswith("/") else "/" + s)
+        try:
+            r = requests.get(s, timeout=20)
+            if r.status_code == 200:
+                contents.append(r.text)
+        except Exception as e:
+            print(f"  ✗ couldn't fetch {s}: {type(e).__name__}")
+
+    # Search for relevant URL patterns
+    keywords = ["api", "download", "ground", "truth", "leaderboard", "task"]
+    interesting = set()
+    for txt in contents:
+        # Absolute URLs
+        for m in re.findall(r'["\'](https?://[^"\'\s]+)["\']', txt):
+            if any(kw in m.lower() for kw in keywords):
+                interesting.add(m)
+        # Relative API paths
+        for m in re.findall(r'["\'](\/api\/[^"\'\s]+)["\']', txt):
+            interesting.add(m)
+
+    # Filter out obviously-templated patterns (contain :param or {var})
+    # but keep them visible since they reveal the structure
+    print(f"\nFound {len(interesting)} candidate URL(s):")
+    for u in sorted(interesting):
+        print(f"  {u}")
+    return list(interesting)
+
+
 def probe_endpoint(task_id):
     """Try each API pattern and return the first that works."""
     print(f"Probing API endpoints with task {task_id[:8]}...")
@@ -231,6 +284,8 @@ def main():
                         help="Maximum NEW downloads")
     parser.add_argument("--probe", action="store_true",
                         help="Probe API endpoints and exit (no downloads)")
+    parser.add_argument("--discover", action="store_true",
+                        help="Parse dashboard JS bundles to find real API URLs")
     parser.add_argument("--browser", action="store_true",
                         help="Use Playwright instead of direct HTTP")
     parser.add_argument("--headed", action="store_true",
@@ -245,6 +300,15 @@ def main():
     existing = load_existing_task_ids()
     print(f"Already have {len(existing)} task(s) in training corpus\n")
 
+    # Discover mode: parse JS bundles for API URLs
+    if args.discover:
+        urls = discover_api_urls()
+        if urls:
+            print(f"\n→ Send the dashboard URLs to your AI assistant to build the fetch script.")
+        else:
+            print("\n✗ No API URLs found. Try --browser mode.")
+        return
+
     # Probe-only mode
     if args.probe:
         sample_id = next(iter(existing), "d4517212-279f-413b-a2ed-1896d5f4fdd6")
@@ -253,7 +317,7 @@ def main():
         if endpoint:
             print(f"✓ Found working endpoint: {endpoint}")
         else:
-            print("✗ No API endpoint found via probe. Use --browser fallback.")
+            print("✗ No API endpoint found via probe. Use --discover to parse JS bundles, or --browser fallback.")
         return
 
     # Browser mode
