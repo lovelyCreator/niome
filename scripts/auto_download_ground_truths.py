@@ -33,8 +33,10 @@ except ImportError:
 
 DEFAULT_DASHBOARD = "https://niome-leaderboard.genomes.io"
 DEFAULT_API = "https://niome-api.genomes.io"
-GROUND_TRUTH_URLS_ENDPOINT = f"{DEFAULT_API}/api/tasks/ground_truth_urls"
-TASKS_LIST_ENDPOINT = f"{DEFAULT_API}/api/tasks"
+# The JS bundle uses RELATIVE fetch URLs, which resolve to the dashboard origin
+GROUND_TRUTH_URLS_ENDPOINT = f"{DEFAULT_DASHBOARD}/api/tasks/ground_truth_urls"
+GROUND_TRUTH_FILE_ENDPOINT = f"{DEFAULT_DASHBOARD}/api/tasks/ground_truth_file"
+TASKS_LIST_ENDPOINT = f"{DEFAULT_DASHBOARD}/api/tasks"
 DOWNLOAD_DIR = Path("/tmp/auto_gt")
 TRAINING_INDEX = Path.home() / "niome_training" / "ground_truths" / "index.json"
 COLLECTOR = Path(__file__).parent / "collect_ground_truth.py"
@@ -203,32 +205,50 @@ def inspect_api_calls():
                 print()
 
 
-def fetch_ground_truth_urls():
+def fetch_ground_truth_urls(task_id=None):
     """Hit the dashboard's ground_truth_urls endpoint.
 
-    Returns a dict mapping task_id -> download URL, or None on failure.
-    Tries multiple URL variations and HTTP methods.
+    From inspection: dashboard calls `fetch("/api/tasks/ground_truth_urls", {cache:"no-store"})`
+    relative to its origin, so we hit niome-leaderboard.genomes.io.
+
+    Returns a dict mapping {key: download_url} for the task, or None on failure.
+    The endpoint may need a task_id query param (since the JS fetches it after
+    selecting a task on the page).
     """
     base = GROUND_TRUTH_URLS_ENDPOINT
     candidates = [
-        ("GET",  base),
-        ("GET",  base + "/"),
-        ("GET",  base + "?per_page=100"),
-        ("GET",  base + "?limit=100"),
-        ("GET",  base + "?page=1"),
-        ("POST", base),
-        ("POST", base + "/"),
-        ("PUT",  base),
+        ("GET", base, {}),                                      # bare
+        ("GET", base, {"Referer": DEFAULT_DASHBOARD + "/"}),    # with Referer header
     ]
+    if task_id:
+        # The dashboard might pass task_id via query param when fetching
+        candidates.extend([
+            ("GET", f"{base}?task_id={task_id}", {}),
+            ("GET", f"{base}?id={task_id}", {}),
+            ("GET", f"{base}?taskId={task_id}", {}),
+        ])
+    # Also try the api subdomain
+    api_base = f"{DEFAULT_API}/api/tasks/ground_truth_urls"
+    candidates.extend([
+        ("GET", api_base, {}),
+        ("POST", base, {}),
+    ])
 
-    for method, url in candidates:
+    for entry in candidates:
+        method, url, extra_headers = entry
+        headers = {
+            "Accept": "application/json",
+            "Origin": DEFAULT_DASHBOARD,
+            "User-Agent": "Mozilla/5.0 niome-data-collector",
+            **extra_headers,
+        }
         try:
             if method == "GET":
-                r = requests.get(url, timeout=30)
+                r = requests.get(url, headers=headers, timeout=30)
             elif method == "POST":
-                r = requests.post(url, json={}, timeout=30)
+                r = requests.post(url, json={}, headers=headers, timeout=30)
             elif method == "PUT":
-                r = requests.put(url, json={}, timeout=30)
+                r = requests.put(url, json={}, headers=headers, timeout=30)
             print(f"  {method:4s} {url[:80]} → {r.status_code} ({len(r.content)} bytes)")
             # On non-200, show response body for debugging
             if r.status_code != 200:
