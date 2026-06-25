@@ -15,13 +15,16 @@ Prerequisites on the miner host (Ubuntu 22.04):
 
 Environment variables:
   NIOME_REF_FASTA          required, absolute path to GRCh38 FASTA
-  NIOME_CALLER             "deepvariant" (default) | "clair3" | "bcftools"
+  NIOME_CALLER             "deepvariant" (default) | "clair3" | "bcftools" |
+                           "dual" (DV+bcftools) | "strelka" | "triple" (DV+bcftools+Strelka)
   NIOME_DEEPVARIANT_IMAGE  default: google/deepvariant:1.8.0-gpu
   NIOME_DV_MODEL           default: WGS  (WGS | WES | PACBIO | ONT_R104)
+  NIOME_STRELKA_IMAGE      default: quay.io/biocontainers/strelka:2.9.10--0
   NIOME_CLAIR3_MODEL_PATH  required if NIOME_CALLER=clair3
   NIOME_CLAIR3_PLATFORM    default: ilmn
   NIOME_MIN_QUAL           default: 20  (filter calls below this QUAL)
   NIOME_GPU                default: "1" (use --gpus all for docker callers)
+  NIOME_DBSNP_VCF          path to ClinVar VCF for ID annotation (enables ClinVar-only filter)
 """
 
 import concurrent.futures
@@ -108,6 +111,10 @@ def call_variants(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
         return _call_bcftools(ref_fasta, bam, region, work_dir)
     if CALLER == "dual":
         return _call_dual(ref_fasta, bam, region, work_dir)
+    if CALLER == "strelka":
+        return _call_strelka(ref_fasta, bam, region, work_dir)
+    if CALLER == "triple":
+        return _call_triple(ref_fasta, bam, region, work_dir)
     raise PipelineError(f"Unknown NIOME_CALLER={CALLER!r}")
 
 
@@ -130,6 +137,122 @@ def _call_dual(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
     merged = os.path.join(work_dir, "merged_calls.vcf.gz")
     _run(
         f"bcftools concat -a {dv_vcf} {bcf_vcf} 2>/dev/null "
+        f"| bcftools sort 2>/dev/null "
+        f"| bcftools norm -d all -f {ref_fasta} -Oz -o {merged}",
+        shell=True
+    )
+    _run(["bcftools", "index", "-f", merged])
+    return merged
+
+
+STRELKA_IMAGE = os.environ.get(
+    "NIOME_STRELKA_IMAGE", "quay.io/biocontainers/strelka:2.9.10--0"
+)
+
+
+def _call_strelka(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
+    """Strelka2 germline workflow. Industry-standard indel sensitivity.
+
+    Strelka2 needs to:
+      1. Configure the workflow with input BAM + reference + region
+      2. Run the workflow (multi-threaded)
+      3. The output VCF is at <run_dir>/results/variants/variants.vcf.gz
+    """
+    chrom, _, span = region.partition(":")
+    start, _, end = span.partition("-")
+    threads = max(1, (os.cpu_count() or 4) // 2)
+
+    # Strelka writes to its own run-dir. Must NOT exist or it errors.
+    run_dir = os.path.join(work_dir, "strelka_run")
+    if os.path.exists(run_dir):
+        shutil.rmtree(run_dir)
+
+    # Write a BED file for the region (Strelka uses --callRegions)
+    bed_path = os.path.join(work_dir, "strelka_region.bed")
+    if start and end:
+        with open(bed_path, "w") as f:
+            f.write(f"{chrom}\t{start}\t{end}\n")
+    else:
+        # Whole chromosome — write full length from FASTA index
+        bed_path = None
+
+    ref_dir = os.path.dirname(os.path.abspath(ref_fasta))
+    bam_dir = os.path.dirname(os.path.abspath(bam))
+    out_dir = os.path.abspath(work_dir)
+    bed_in_container = "/out/strelka_region.bed.gz" if bed_path else None
+
+    # bgzip + tabix the BED for Strelka (--callRegions requires .bed.gz with .tbi)
+    if bed_path:
+        _run(["bgzip", "-f", bed_path])
+        bgz_path = bed_path + ".gz"
+        _run(["tabix", "-f", "-p", "bed", bgz_path])
+
+    # Configure
+    configure_cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{ref_dir}:/ref",
+        "-v", f"{bam_dir}:/bam",
+        "-v", f"{out_dir}:/out",
+        STRELKA_IMAGE,
+        "configureStrelkaGermlineWorkflow.py",
+        f"--bam=/bam/{os.path.basename(bam)}",
+        f"--referenceFasta=/ref/{os.path.basename(ref_fasta)}",
+        f"--runDir=/out/strelka_run",
+    ]
+    if bed_path:
+        configure_cmd.append(f"--callRegions=/out/strelka_region.bed.gz")
+    _run(configure_cmd)
+
+    # Run the workflow
+    run_cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{ref_dir}:/ref",
+        "-v", f"{bam_dir}:/bam",
+        "-v", f"{out_dir}:/out",
+        STRELKA_IMAGE,
+        "/out/strelka_run/runWorkflow.py",
+        "-m", "local",
+        "-j", str(threads),
+    ]
+    _run(run_cmd)
+
+    # Strelka output
+    raw_vcf = os.path.join(run_dir, "results", "variants", "variants.vcf.gz")
+    if not os.path.exists(raw_vcf):
+        raise PipelineError(f"Strelka did not produce {raw_vcf}")
+
+    # Copy to a stable location for downstream
+    out_vcf = os.path.join(work_dir, "strelka_calls.vcf.gz")
+    shutil.copy2(raw_vcf, out_vcf)
+    _run(["bcftools", "index", "-f", out_vcf])
+    return out_vcf
+
+
+def _call_triple(ref_fasta: str, bam: str, region: str, work_dir: str) -> str:
+    """DeepVariant + bcftools + Strelka2. Merge all three.
+
+    Each catches different variant categories:
+      - DeepVariant: high-VAF SNVs + clear indels (the workhorse)
+      - bcftools: secondary check for over/under-calling
+      - Strelka2: low-VAF indels (DeepVariant's weakness)
+
+    Combined → ClinVar filter (in downstream annotate step) → only true CFTR variants survive.
+    """
+    dv_vcf = _call_deepvariant(ref_fasta, bam, region, work_dir)
+    try:
+        strelka_vcf = _call_strelka(ref_fasta, bam, region, work_dir)
+    except PipelineError as e:
+        bt.logging.warning(f"Strelka failed, continuing with DV+bcftools only: {e}")
+        strelka_vcf = None
+    bcf_vcf = _call_bcftools_supplementary(ref_fasta, bam, region, work_dir)
+
+    inputs = [dv_vcf, bcf_vcf]
+    if strelka_vcf:
+        inputs.append(strelka_vcf)
+
+    merged = os.path.join(work_dir, "merged_calls.vcf.gz")
+    _run(
+        f"bcftools concat -a {' '.join(inputs)} 2>/dev/null "
         f"| bcftools sort 2>/dev/null "
         f"| bcftools norm -d all -f {ref_fasta} -Oz -o {merged}",
         shell=True
