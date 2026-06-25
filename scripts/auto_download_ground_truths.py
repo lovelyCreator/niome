@@ -240,41 +240,41 @@ def fetch_ground_truth_urls():
                 print(f"        non-json content-type: {ct}")
                 continue
             data = r.json()
-                # Normalize: data could be {task_id: url}, list of {id, url}, or other
-                mapping = {}
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if UUID_RE.match(k) and isinstance(v, str) and v.startswith("http"):
-                            mapping[k] = v
-                    # Or it could be wrapped: {"data": {...}, "urls": {...}}
-                    for wrapper in ("data", "urls", "ground_truth_urls", "tasks"):
-                        if wrapper in data:
-                            inner = data[wrapper]
-                            if isinstance(inner, dict):
-                                for k, v in inner.items():
-                                    if UUID_RE.match(k) and isinstance(v, str) and v.startswith("http"):
-                                        mapping[k] = v
-                            elif isinstance(inner, list):
-                                for item in inner:
-                                    if isinstance(item, dict):
-                                        tid = item.get("task_id") or item.get("id")
-                                        url = item.get("url") or item.get("ground_truth_url") or item.get("download_url")
-                                        if tid and url:
-                                            mapping[tid] = url
-                elif isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            tid = item.get("task_id") or item.get("id")
-                            url = item.get("url") or item.get("ground_truth_url") or item.get("download_url")
-                            if tid and url:
-                                mapping[tid] = url
-                if mapping:
-                    print(f"  ✓ Found {len(mapping)} task→URL mappings")
-                    return mapping
-                # No mappings recognized — dump first 500 chars to help debug
-                print(f"  ? Response shape not recognized. First 500 chars:")
-                print(f"    {r.text[:500]}")
-                return None
+            # Normalize: data could be {task_id: url}, list of {id, url}, or other
+            mapping = {}
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if UUID_RE.match(k) and isinstance(v, str) and v.startswith("http"):
+                        mapping[k] = v
+                # Or it could be wrapped: {"data": {...}, "urls": {...}}
+                for wrapper in ("data", "urls", "ground_truth_urls", "tasks"):
+                    if wrapper in data:
+                        inner = data[wrapper]
+                        if isinstance(inner, dict):
+                            for k, v in inner.items():
+                                if UUID_RE.match(k) and isinstance(v, str) and v.startswith("http"):
+                                    mapping[k] = v
+                        elif isinstance(inner, list):
+                            for item in inner:
+                                if isinstance(item, dict):
+                                    tid = item.get("task_id") or item.get("id")
+                                    url = item.get("url") or item.get("ground_truth_url") or item.get("download_url")
+                                    if tid and url:
+                                        mapping[tid] = url
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        tid = item.get("task_id") or item.get("id")
+                        url = item.get("url") or item.get("ground_truth_url") or item.get("download_url")
+                        if tid and url:
+                            mapping[tid] = url
+            if mapping:
+                print(f"  ✓ Found {len(mapping)} task→URL mappings")
+                return mapping
+            # No mappings recognized — dump first 500 chars to help debug
+            print(f"  ? Response shape not recognized. First 500 chars:")
+            print(f"    {r.text[:500]}")
+            return None
         except Exception as e:
             print(f"  {method} failed: {type(e).__name__}: {e}")
     return None
