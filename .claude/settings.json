@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('d:/work/bittensor/niome_55/scripts/auto_download_ground_truths.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('d:/work/bittensor/niome_55/scripts/watch_for_ground_truths.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('d:/work/bittensor/niome_55/niome_subnet/genomics/pipeline.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('neurons/miner.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('neurons/miner.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Use validator'\\\\''s expected_variant_count: short-circuit 0-count tasks, trim over-calls to top-N by QUAL *)",
+      "Bash(git push *)",
+      "Bash(git commit -m 'Handle probe tasks gracefully + return well-formed VCF on error *)"
+    ]
+  }
+}
