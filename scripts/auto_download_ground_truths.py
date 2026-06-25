@@ -161,25 +161,85 @@ def discover_api_urls():
     return list(interesting)
 
 
+def inspect_api_calls():
+    """Find the exact fetch/axios call shape in the dashboard JS bundles.
+
+    Shows context around each interesting API call so we can see if it uses
+    query params, request body, custom headers, etc.
+    """
+    print("Fetching dashboard HTML + JS bundles to inspect API calls...")
+    try:
+        r = requests.get(DEFAULT_DASHBOARD, timeout=30)
+        html = r.text
+    except Exception as e:
+        print(f"  ✗ failed to fetch dashboard: {e}")
+        return
+
+    scripts = re.findall(r'<script[^>]*src=["\']([^"\']+)["\']', html)
+    contents = [(DEFAULT_DASHBOARD, html)]
+    for s in scripts:
+        if not s.startswith("http"):
+            s = DEFAULT_DASHBOARD + (s if s.startswith("/") else "/" + s)
+        try:
+            rr = requests.get(s, timeout=20)
+            if rr.status_code == 200:
+                contents.append((s, rr.text))
+        except Exception:
+            pass
+
+    print(f"  inspecting {len(contents)} JS sources for API call context\n")
+
+    # Search for key API paths and show 200 chars of surrounding context
+    keywords = ["ground_truth_urls", "ground_truth", "api/tasks", "api/leaderboard",
+                "api/miner_scores", "api/niome_snapshot"]
+    for src, txt in contents:
+        for kw in keywords:
+            for m in re.finditer(re.escape(kw), txt):
+                start = max(0, m.start() - 150)
+                end = min(len(txt), m.end() + 250)
+                snippet = txt[start:end].replace("\n", "\\n")
+                print(f"--- {kw} in {src.split('/')[-1][:40]} ---")
+                print(f"    ...{snippet}...")
+                print()
+
+
 def fetch_ground_truth_urls():
-    """Hit the dashboard's /api/tasks/ground_truth_urls endpoint.
+    """Hit the dashboard's ground_truth_urls endpoint.
 
     Returns a dict mapping task_id -> download URL, or None on failure.
-    Tries both GET and POST since we don't know the protocol yet.
+    Tries multiple URL variations and HTTP methods.
     """
-    print(f"Calling {GROUND_TRUTH_URLS_ENDPOINT} ...")
+    base = GROUND_TRUTH_URLS_ENDPOINT
+    candidates = [
+        ("GET",  base),
+        ("GET",  base + "/"),
+        ("GET",  base + "?per_page=100"),
+        ("GET",  base + "?limit=100"),
+        ("GET",  base + "?page=1"),
+        ("POST", base),
+        ("POST", base + "/"),
+        ("PUT",  base),
+    ]
 
-    # Try GET first
-    for method in ("GET", "POST"):
+    for method, url in candidates:
         try:
             if method == "GET":
-                r = requests.get(GROUND_TRUTH_URLS_ENDPOINT, timeout=30)
-            else:
-                r = requests.post(GROUND_TRUTH_URLS_ENDPOINT, json={}, timeout=30)
-            print(f"  {method} → {r.status_code} ({len(r.content)} bytes)")
+                r = requests.get(url, timeout=30)
+            elif method == "POST":
+                r = requests.post(url, json={}, timeout=30)
+            elif method == "PUT":
+                r = requests.put(url, json={}, timeout=30)
+            print(f"  {method:4s} {url[:80]} → {r.status_code} ({len(r.content)} bytes)")
+            # On non-200, show response body for debugging
+            if r.status_code != 200:
+                snippet = r.text[:300].replace("\n", " ")
+                print(f"        body: {snippet}")
+                continue
             ct = r.headers.get("content-type", "")
-            if r.status_code == 200 and "json" in ct:
-                data = r.json()
+            if "json" not in ct:
+                print(f"        non-json content-type: {ct}")
+                continue
+            data = r.json()
                 # Normalize: data could be {task_id: url}, list of {id, url}, or other
                 mapping = {}
                 if isinstance(data, dict):
@@ -373,6 +433,8 @@ def main():
                         help="Probe API endpoints and exit (no downloads)")
     parser.add_argument("--discover", action="store_true",
                         help="Parse dashboard JS bundles to find real API URLs")
+    parser.add_argument("--inspect", action="store_true",
+                        help="Show surrounding JS context for API calls (reveals request shape)")
     parser.add_argument("--browser", action="store_true",
                         help="Use Playwright instead of direct HTTP")
     parser.add_argument("--headed", action="store_true",
@@ -386,6 +448,11 @@ def main():
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     existing = load_existing_task_ids()
     print(f"Already have {len(existing)} task(s) in training corpus\n")
+
+    # Inspect mode: show JS context around API calls
+    if args.inspect:
+        inspect_api_calls()
+        return
 
     # Discover mode: parse JS bundles for API URLs
     if args.discover:
