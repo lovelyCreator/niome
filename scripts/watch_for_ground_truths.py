@@ -57,9 +57,9 @@ REQUEST_HEADERS = {
 }
 
 # Polling cadence
-POLL_TASKS_INTERVAL = 60          # seconds between fetching task list
-POLL_GT_INTERVAL = 60             # seconds between retries for a task's GT
-TASK_GT_MAX_RETRIES = 30          # 30 retries × 60s = 30 min per task
+POLL_TASKS_INTERVAL = 120         # seconds between fetching task list
+TASK_RETRY_COOLDOWN = 300         # don't retry same task within 5 min (rate limit)
+INTER_TASK_SLEEP = 0.5            # seconds between successive task attempts
 STATE_SAVE_INTERVAL = 30          # seconds between state file syncs
 
 
@@ -223,21 +223,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true",
                         help="Single poll cycle and exit (for debugging)")
-    parser.add_argument("--retry-permanent", action="store_true",
-                        help="Re-attempt task IDs marked permanent_404 (giving them a fresh chance)")
     args = parser.parse_args()
 
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     state = load_state()
-    if args.retry_permanent:
-        log(f"Clearing {len(state['permanent_404'])} permanent_404 entries for re-try")
-        state["permanent_404"] = []
-        save_state(state)
+
+    # Migrate any prior permanent_404 entries back to the retry pool. Historical
+    # tasks have proven downloadable hours/days after task creation, so we never
+    # give up — we just slow down retries via per-task cooldown.
+    migrated = state.pop("permanent_404", [])
+    if migrated:
+        log(f"Migrating {len(migrated)} previously-permanent_404 tasks back to retry pool")
+
+    # last_attempt: {task_id: unix_ts of last fetch attempt}
+    state.setdefault("last_attempt", {})
+    state.setdefault("attempted", {})
+    state.setdefault("succeeded", [])
 
     log("=== Ground truth watcher started ===")
     log(f"Already imported: {len(load_imported_task_ids())} task(s)")
-    log(f"Attempted: {len(state['attempted'])}, succeeded: {len(state['succeeded'])}, perm_404: {len(state['permanent_404'])}")
+    log(f"Tried previously: {len(state['attempted'])}, succeeded: {len(state['succeeded'])}")
+    log(f"Retry cooldown: {TASK_RETRY_COOLDOWN}s per task; poll cadence: {POLL_TASKS_INTERVAL}s")
 
     def shutdown(sig, frame):
         log("Received signal, saving state and exiting")
@@ -254,45 +261,49 @@ def main():
         log(f"--- cycle {cycle} ---")
 
         imported = load_imported_task_ids()
-
-        # Fetch current visible task IDs
         task_ids = fetch_task_list()
-        log(f"Dashboard shows {len(task_ids)} task ID(s)")
+        log(f"Dashboard shows {len(task_ids)} task ID(s), {len(imported)} already imported")
 
-        # Pick candidates: new (not imported, not permanently failed)
-        candidates = [
+        # Pick candidates: visible on dashboard AND not yet imported AND
+        # not retried within the cooldown window.
+        now = time.time()
+        eligible = [
             tid for tid in task_ids
-            if tid not in imported and tid not in state["permanent_404"]
+            if tid not in imported
+            and (now - state["last_attempt"].get(tid, 0)) >= TASK_RETRY_COOLDOWN
         ]
-        log(f"  {len(candidates)} candidate(s) to try")
+        skipped_cooldown = len([tid for tid in task_ids
+                                if tid not in imported
+                                and (now - state["last_attempt"].get(tid, 0)) < TASK_RETRY_COOLDOWN])
+        log(f"  {len(eligible)} eligible to try, {skipped_cooldown} in cooldown")
 
-        for task_id in candidates:
-            attempts = state["attempted"].get(task_id, 0)
-            if attempts >= TASK_GT_MAX_RETRIES:
-                log(f"  ↻ {task_id}: exhausted {attempts} retries, marking permanent_404")
-                state["permanent_404"].append(task_id)
-                state["attempted"].pop(task_id, None)
-                continue
+        new_successes = 0
+        for task_id in eligible:
+            attempts = state["attempted"].get(task_id, 0) + 1
+            state["attempted"][task_id] = attempts
+            state["last_attempt"][task_id] = time.time()
 
-            log(f"  → {task_id} (attempt {attempts + 1}/{TASK_GT_MAX_RETRIES})")
             data, info = try_fetch_ground_truth_urls(task_id)
-            state["attempted"][task_id] = attempts + 1
-
             if data is None:
-                log(f"    × {info}")
-                continue
-
-            log(f"    ✓ got URLs via {info}: {list(data.keys())[:6]}")
-            task_dir = save_task_files(task_id, data, DOWNLOAD_DIR)
-            if task_dir and import_into_corpus(task_dir, task_id):
-                state["succeeded"].append(task_id)
-                state["attempted"].pop(task_id, None)
+                # Only log first 2 attempts and every 10th retry — avoid log spam
+                if attempts <= 2 or attempts % 10 == 0:
+                    log(f"  × {task_id} (try #{attempts}): {info}")
+            else:
+                log(f"  ✓ {task_id} (try #{attempts}): got URLs {list(data.keys())[:6]}")
+                task_dir = save_task_files(task_id, data, DOWNLOAD_DIR)
+                if task_dir and import_into_corpus(task_dir, task_id):
+                    if task_id not in state["succeeded"]:
+                        state["succeeded"].append(task_id)
+                    new_successes += 1
 
             if time.time() - last_state_save > STATE_SAVE_INTERVAL:
                 save_state(state)
                 last_state_save = time.time()
 
+            time.sleep(INTER_TASK_SLEEP)  # rate-limit API
+
         save_state(state)
+        log(f"  Cycle {cycle} complete: +{new_successes} new ground truths")
 
         if args.once:
             log("--once flag set, exiting")
