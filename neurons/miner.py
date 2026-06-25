@@ -62,10 +62,26 @@ class Miner(BaseMinerNeuron):
     async def forward(self, synapse: GenomicsTaskSynapse) -> GenomicsTaskSynapse:
         start_time = time.time()
         task = synapse.task
+        expected_n = getattr(task, "expected_variant_count", None)
         bt.logging.info(
             f"Task {task.task_id} gene={task.genome_context.gene} "
-            f"region={task.genome_context.chromosome}:{task.genome_context.region}"
+            f"region={task.genome_context.chromosome}:{task.genome_context.region} "
+            f"expected_n={expected_n}"
         )
+
+        # Validator declares expected variant count. expected_n == 0 means a
+        # negative-control task — emitting ANY calls = false positives = 0 score.
+        # Toggle off via NIOME_USE_EXPECTED_COUNT=false if the field turns out
+        # to be unreliable.
+        use_expected = os.environ.get("NIOME_USE_EXPECTED_COUNT", "true").lower() == "true"
+        if use_expected and expected_n == 0:
+            synapse.vcf_content = self._empty_vcf(task.genome_context.chromosome)
+            synapse.cftr_annotations = {}
+            bt.logging.info(
+                f"Task {task.task_id}: expected_n=0, returning empty VCF "
+                f"({time.time()-start_time:.2f}s)"
+            )
+            return synapse
 
         try:
             vcf_content = await asyncio.to_thread(
@@ -75,6 +91,11 @@ class Miner(BaseMinerNeuron):
                 task.genome_context.chromosome,
                 task.genome_context.region,
             )
+
+            trim_enabled = os.environ.get("NIOME_TRIM_TO_EXPECTED", "true").lower() == "true"
+            if trim_enabled and isinstance(expected_n, int) and expected_n > 0:
+                vcf_content = self._trim_vcf_to_top_n(vcf_content, expected_n)
+
             cftr_annotations = self.annotator.annotate_vcf(vcf_content)
 
             synapse.vcf_content = vcf_content
@@ -85,8 +106,8 @@ class Miner(BaseMinerNeuron):
                 if line and not line.startswith("#")
             )
             bt.logging.info(
-                f"Task {task.task_id} done: {variant_count} variants, "
-                f"{len(cftr_annotations)} annotations, "
+                f"Task {task.task_id} done: {variant_count} variants "
+                f"(expected {expected_n}), {len(cftr_annotations)} annotations, "
                 f"{time.time() - start_time:.1f}s"
             )
         except Exception as e:
@@ -95,6 +116,38 @@ class Miner(BaseMinerNeuron):
             synapse.cftr_annotations = {}
 
         return synapse
+
+    @staticmethod
+    def _empty_vcf(chrom: str) -> str:
+        return (
+            "##fileformat=VCFv4.2\n"
+            f"##contig=<ID={chrom}>\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        )
+
+    @staticmethod
+    def _trim_vcf_to_top_n(vcf_text: str, n: int) -> str:
+        """If more than n variant rows, keep the n with highest QUAL."""
+        header_lines = []
+        variant_lines = []
+        for line in vcf_text.splitlines():
+            if not line.strip():
+                continue
+            if line.startswith("#"):
+                header_lines.append(line)
+            else:
+                variant_lines.append(line)
+        if len(variant_lines) <= n:
+            return vcf_text
+
+        def qual_of(line):
+            try:
+                return float(line.split("\t")[5])
+            except (IndexError, ValueError):
+                return 0.0
+
+        variant_lines.sort(key=qual_of, reverse=True)
+        return "\n".join(header_lines + variant_lines[:n]) + "\n"
 
     def _generate_signature(self, answer_str: str, confidence: float) -> str:
         """Generate cryptographic signature for answer."""
