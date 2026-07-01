@@ -59,9 +59,14 @@ class BaseNeuron(ABC):
         return ttl_get_block(self)
 
     def __init__(self, config=None):
-        base_config = copy.deepcopy(config or BaseNeuron.config())
+        # Use the full Miner/Validator config (which has --neuron.name and all
+        # subclass args). Only merge in a user-provided config on top of it.
+        # bittensor 10.5+ Config.merge wipes namespaces that don't exist in the
+        # "other" config, so merging a bare BaseNeuron.config() would drop the
+        # `neuron` namespace and break `config.neuron.name` below.
         self.config = self.config()
-        self.config.merge(base_config)
+        if config is not None:
+            self.config.merge(copy.deepcopy(config))
         self.check_config(self.config)
 
         # Set up logging with the provided configuration.

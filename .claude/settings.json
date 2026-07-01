@@ -9,7 +9,14 @@
       "Bash(git add *)",
       "Bash(git commit -m 'Use validator'\\\\''s expected_variant_count: short-circuit 0-count tasks, trim over-calls to top-N by QUAL *)",
       "Bash(git push *)",
-      "Bash(git commit -m 'Handle probe tasks gracefully + return well-formed VCF on error *)"
+      "Bash(git commit -m 'Handle probe tasks gracefully + return well-formed VCF on error *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/watch_for_ground_truths.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git commit -m 'Never give up on tasks — historical ground truths can appear hours/days later *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/collect_ground_truth.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('scripts/dedupe_ground_truths.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git commit -m 'Auto-deduplicate ground truths by truth.vcf hash + cleanup script *)",
+      "Bash(git commit -m 'Watcher: include aliases in '\\\\''already imported'\\\\'' set *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('neurons/miner.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('niome_subnet/genomics/lookup_cache.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git commit -m 'Add lookup cache: return verbatim truth for known reads_hash \\(winner strategy\\) *)"
     ]
   }
 }
