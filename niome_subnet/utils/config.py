@@ -264,4 +264,25 @@ def config(cls):
     bt.logging.add_args(parser)
     bt.Axon.add_args(parser)
     cls.add_args(parser)
-    return bt.Config(parser)
+    cfg = bt.Config(parser)
+
+    # bittensor 10.5+ no longer auto-nests dotted args (--neuron.name etc.).
+    # Rebuild the `neuron` namespace from parser defaults so downstream code
+    # (check_config, config.neuron.name, etc.) keeps working.
+    _ensure_dotted_namespaces(cfg, parser, ("neuron", "blacklist", "wandb"))
+    return cfg
+
+
+def _ensure_dotted_namespaces(cfg, parser, prefixes):
+    """Ensure `cfg.<prefix>` is a namespace with the parser's --prefix.* defaults."""
+    args = vars(parser.parse_args([]))  # defaults only
+    for prefix in prefixes:
+        current = getattr(cfg, prefix, None)
+        if current is None:
+            current = bt.Config()
+            setattr(cfg, prefix, current)
+        for k, v in args.items():
+            if k.startswith(f"{prefix}."):
+                sub = k.split(".", 1)[1]
+                if not hasattr(current, sub) or getattr(current, sub) is None:
+                    setattr(current, sub, v)
